@@ -85,7 +85,7 @@ svg.i{width:20px;height:20px;fill:none;stroke:currentColor;stroke-width:1.9;stro
 .bubble{padding:12px 16px;border-radius:18px;line-height:1.6;max-width:min(680px,88%);overflow-wrap:anywhere}
 .msg.user .bubble{background:linear-gradient(135deg,var(--cobalt),var(--azure));color:#fff;border-bottom-right-radius:6px;white-space:pre-wrap}
 .msg.ai .bubble{background:#fff;border:1px solid var(--line);border-top-left-radius:6px}
-.msg.err .bubble{background:#FFF1F3;border:1px solid #F6C1CB;color:#8E1B33}
+.msg.err .bubble{background:#FFF1F3;border:1px solid #F6C1CB;color:#8E1B33;white-space:pre-wrap}
 .bubble p+p,.bubble p+ul,.bubble p+ol,.bubble ul+p,.bubble ol+p,.bubble pre+p,.bubble p+pre{margin-top:.6em}
 .bubble ul,.bubble ol{padding-left:1.3em;margin-top:.4em}
 .bubble li+li{margin-top:.2em}
@@ -376,8 +376,8 @@ dialog::backdrop{background:rgba(8,21,51,.55);backdrop-filter:blur(3px)}
     <input id="keyInput" type="password" autocomplete="off" spellcheck="false" placeholder="AIza...">
     <small>Kunci disimpan hanya di browser ini (tidak dikirim ke server mana pun selain Google). Jangan bagikan kuncimu ke orang lain.</small>
     <label for="modelInput">Model</label>
-    <input id="modelInput" type="text" autocomplete="off" spellcheck="false" placeholder="gemini-3.7-flash">
-    <small>Kalau muncul error model tidak ditemukan, ganti dengan nama model terbaru di ai.google.dev/gemini-api/docs/models. Paket gratis Google dapat memakai percakapan untuk meningkatkan produk mereka, jadi hindari mengirim data pribadi yang sensitif.</small>
+    <input id="modelInput" type="text" autocomplete="off" spellcheck="false" placeholder="kosongkan = otomatis">
+    <small>Biarkan kosong supaya Ibam AI memilih model yang tersedia secara otomatis. Isi hanya kalau kamu ingin model tertentu (nama modelnya ada di ai.google.dev/gemini-api/docs/models). Paket gratis Google dapat memakai percakapan untuk meningkatkan produk mereka, jadi hindari mengirim data pribadi yang sensitif.</small>
     <div class="acts">
       <button class="btn primary" id="btnSaveKey">Simpan</button>
       <button class="btn warn" id="btnDelKey">Hapus kunci</button>
@@ -439,8 +439,7 @@ tickClock(); setInterval(tickClock, 15000);
 /* =========================================================
    IBAM AI
    ========================================================= */
-const DEFAULT_MODEL = 'gemini-3.7-flash';
-const FALLBACK_MODELS = ['gemini-3.5-flash', 'gemini-2.5-flash'];
+const AUTO_MODELS = ['gemini-3.1-flash-lite', 'gemini-2.5-flash-lite', 'gemini-2.5-flash', 'gemini-3.5-flash', 'gemini-3.7-flash'];
 let chat = store.get('chat', []);
 let busy = false;
 let lastError = null;
@@ -574,47 +573,60 @@ function friendlyError(err) {
   if (!err.status && (err instanceof TypeError || /failed to fetch|networkerror|load failed|network/i.test(msg))) {
     return 'Tidak bisa terhubung ke Google. Periksa koneksi internetmu. Kalau kamu membuka lewat pratinjau di Claude, sambungan memang diblokir di sana, jadi coba buka dari alamat GitHub Pages-mu.';
   }
-  if (err.status === 400 && /API key/i.test(msg)) return 'Kunci API tidak valid. Buka Pengaturan dan tempel kunci yang benar.';
-  if (err.status === 401 || err.status === 403) return 'Kunci API ditolak. Pastikan kuncinya aktif, lalu coba lagi lewat Pengaturan.';
-  if (err.status === 404) return 'Model tidak ditemukan. Buka Pengaturan dan isi nama model yang tersedia untuk akunmu.';
-  if (err.status === 429) return 'Kuota gratis sedang penuh. Tunggu sebentar lalu kirim lagi.';
-  return msg || 'Terjadi kesalahan. Coba lagi.';
+  let out;
+  if (err.status === 400 && /API key/i.test(msg)) out = 'Kunci API tidak valid. Buka Pengaturan dan tempel kunci yang benar.';
+  else if (err.status === 401 || err.status === 403) out = 'Kunci API ditolak atau tidak punya izin. Pastikan kuncinya aktif, lalu coba lagi lewat Pengaturan.';
+  else if (err.status === 404) out = 'Tidak ada model yang tersedia untuk akunmu. Buka Pengaturan dan isi nama model dari Google AI Studio.';
+  else if (err.status === 429) out = 'Jatah gratis untuk model yang dicoba sedang habis. Tunggu beberapa menit lalu kirim lagi.';
+  else out = msg || 'Terjadi kesalahan. Coba lagi.';
+  return out + (err.detail ? '\n\nDetail: ' + err.detail : '');
 }
 
 async function askGemini() {
   const key = store.get('key');
-  const chosen = (store.get('model') || DEFAULT_MODEL).trim();
-  const models = [...new Set([chosen, ...FALLBACK_MODELS])];
+  const custom = (store.get('model') || '').trim();
+  const ok = store.get('ok');
+  const order = [...new Set([custom, ok && ok.m, ...AUTO_MODELS].filter(Boolean))];
+  const attempts = [];
+  order.forEach(m => {
+    if (ok && ok.m === m && ok.s === false) attempts.push({ m, s: false });
+    else { attempts.push({ m, s: true }); attempts.push({ m, s: false }); }
+  });
   const contents = chat.slice(-24).map(m => ({ role: m.role, parts: [{ text: m.text }] }));
   while (contents[0] && contents[0].role !== 'user') contents.shift();
-  let useSearch = true, lastErr;
 
-  for (const model of models) {
-    let res, data;
-    for (let attempt = 0; attempt < 2; attempt++) {
-      const body = { systemInstruction: { parts: [{ text: systemPrompt() }] }, contents, generationConfig: { temperature: 0.8 } };
-      if (useSearch) body.tools = [{ google_search: {} }];
-      res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(model) + ':generateContent', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
-        body: JSON.stringify(body)
-      });
-      data = await res.json().catch(() => ({}));
-      /* Kalau pencarian internet ditolak untuk akun/model ini, coba lagi tanpa pencarian */
-      if (!res.ok && useSearch && (res.status === 400 || res.status === 403) && /search|ground|tool/i.test(data?.error?.message || '')) { useSearch = false; continue; }
-      break;
+  const tried = []; let best = null;
+  for (const a of attempts) {
+    const body = { systemInstruction: { parts: [{ text: systemPrompt() }] }, contents, generationConfig: { temperature: 0.8 } };
+    if (a.s) body.tools = [{ google_search: {} }];
+    const res = await fetch('https://generativelanguage.googleapis.com/v1beta/models/' + encodeURIComponent(a.m) + ':generateContent', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'x-goog-api-key': key },
+      body: JSON.stringify(body)
+    });
+    const data = await res.json().catch(() => ({}));
+
+    if (res.ok) {
+      const cand = data.candidates?.[0];
+      const text = (cand?.content?.parts || []).map(p => p.text || '').join('').trim();
+      if (!text) throw new Error(data.promptFeedback?.blockReason ? 'Pertanyaan diblokir filter keamanan. Coba ubah kalimatnya.' : 'Ibam AI tidak mengirim jawaban. Coba kirim ulang.');
+      store.set('ok', { m: a.m, s: a.s });
+      const seen = new Set();
+      const sources = (cand?.groundingMetadata?.groundingChunks || []).map(c => c.web).filter(w => w && w.uri && !seen.has(w.uri) && seen.add(w.uri));
+      return { text, sources };
     }
-    if (res.status === 404) { lastErr = apiError(res, data); continue; }
-    if (!res.ok) throw apiError(res, data);
 
-    const cand = data.candidates?.[0];
-    const text = (cand?.content?.parts || []).map(p => p.text || '').join('').trim();
-    if (!text) throw new Error(data.promptFeedback?.blockReason ? 'Pertanyaan diblokir filter keamanan. Coba ubah kalimatnya.' : 'Ibam AI tidak mengirim jawaban. Coba kirim ulang.');
-    const seen = new Set();
-    const sources = (cand?.groundingMetadata?.groundingChunks || []).map(c => c.web).filter(w => w && w.uri && !seen.has(w.uri) && seen.add(w.uri));
-    return { text, sources };
+    const err = apiError(res, data);
+    tried.push(a.m + (a.s ? ' + pencarian' : '') + ' = ' + res.status);
+    if (!best || err.status !== 404) best = err;
+    /* Kunci bermasalah: tidak ada gunanya mencoba model lain */
+    if (res.status === 401 || (res.status === 400 && /API key/i.test(err.message)) ||
+        (res.status === 403 && !/search|ground|tool|quota|limit/i.test(err.message))) {
+      err.detail = err.message.slice(0, 300); throw err;
+    }
   }
-  throw lastErr;
+  best.detail = 'Sudah dicoba: ' + tried.join('; ') + '. Pesan Google: ' + best.message.slice(0, 300);
+  throw best;
 }
 
 async function send(text) {
@@ -655,7 +667,7 @@ const dlg = $('#dlg');
 function openDlg() {
   $('#keyInput').value = store.get('key') || '';
   $('#modelInput').value = store.get('model') || '';
-  $('#modelInput').placeholder = DEFAULT_MODEL;
+  $('#modelInput').placeholder = 'kosongkan = otomatis';
   dlg.showModal();
 }
 $('#btnSettings').addEventListener('click', openDlg);
